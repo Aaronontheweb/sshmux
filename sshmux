@@ -101,7 +101,10 @@ Usage:
   sshmux list                         Show all configured machines (table)
   sshmux hosts [machine]              Interactive host + session picker (fzf)
   sshmux sessions [machine]           Interactive session picker on a machine (fzf)
-  sshmux tabs [machine]               Open one tab per tmux session (mux-aware)
+EOF
+  [[ -n "${TMUX:-}" || -n "${ZELLIJ_SESSION_NAME:-}" ]] && \
+    echo "  sshmux tabs [machine]               Open one tab per tmux session (mux-aware)"
+  cat <<'EOF'
   sshmux new <session> [machine]      Create / attach a named tmux session
   sshmux add                          Add a new machine interactively
   sshmux default <machine>            Set the default machine
