@@ -210,7 +210,7 @@ _pick_session_on() {
   else
     session=$(echo "$sessions" | fzf_pick "$machine session> " \
       --header="TAB to multi-select, ENTER to connect (or type a new session name)" \
-      --print-query --bind "tab:toggle" 2>/dev/null \
+      --print-query --bind "tab:toggle" \
       | tail -1) || true
 
     [[ -z "$session" ]] && { echo "sshmux: no session selected."; exit 0; }
