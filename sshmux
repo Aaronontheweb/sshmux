@@ -434,8 +434,17 @@ main() {
     return
   fi
 
-  # Unknown first arg: treat as machine name (implicit connect)
-  cmd_connect "$@"
+  # Unknown first arg: if it matches a configured machine, connect to it;
+  # otherwise treat it as a session name on the default machine.
+  require_config
+  parse_config
+  local m; for m in "${MACHINES[@]}"; do
+    if [[ "$m" == "$verb" ]]; then
+      cmd_connect "$@"
+      return
+    fi
+  done
+  cmd_connect "" "$verb"
 }
 
 main "$@"
