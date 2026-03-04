@@ -1,0 +1,432 @@
+#!/usr/bin/env bash
+# sshmux — SSH + tmux session manager for multiple remote machines
+# https://github.com/aaronontheweb/sshmux
+
+set -euo pipefail
+
+CONFIG_DIR="${HOME}/.config/sshmux"
+CONFIG_FILE="${CONFIG_DIR}/config"
+
+# ---------------------------------------------------------------------------
+# Config parsing
+# ---------------------------------------------------------------------------
+
+declare -A _CFG   # flat key -> value store: "section.key" -> value
+MACHINES=()       # ordered list of configured machine nicknames
+
+parse_config() {
+  _CFG=()
+  MACHINES=()
+  [[ ! -f "$CONFIG_FILE" ]] && return
+  local section=""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"                       # strip inline comments
+    line="${line#"${line%%[! ]*}"}"          # ltrim
+    line="${line%"${line##*[! ]}"}"          # rtrim
+    [[ -z "$line" ]] && continue
+
+    if [[ "$line" =~ ^\[(.+)\]$ ]]; then
+      section="${BASH_REMATCH[1]}"
+      if [[ "$section" =~ ^machine\.(.+)$ ]]; then
+        MACHINES+=("${BASH_REMATCH[1]}")
+      fi
+    elif [[ "$line" =~ ^([^=]+)=(.*)$ ]]; then
+      local raw_key="${BASH_REMATCH[1]}"
+      local val="${BASH_REMATCH[2]}"
+      raw_key="${raw_key%"${raw_key##*[! ]}"}"
+      val="${val#"${val%%[! ]*}"}"
+      _CFG["${section}.${raw_key}"]="${val}"
+    fi
+  done < "$CONFIG_FILE"
+}
+
+cfg_get()         { echo "${_CFG[${1}.${2}]:-}"; }
+machine_user()    { cfg_get "machine.$1" "user"; }
+machine_host()    { cfg_get "machine.$1" "host"; }
+machine_session() { cfg_get "machine.$1" "default_session"; }
+default_machine() { cfg_get "default" "machine"; }
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+die()            { echo "sshmux: error: $*" >&2; exit 1; }
+require_config() { [[ -f "$CONFIG_FILE" ]] || die "no config found. Run 'sshmux init' to get started."; }
+
+require_machine() {
+  local name="$1"
+  [[ -n "$(machine_user "$name")" ]] \
+    || die "machine '$name' not found. Run 'sshmux list' to see configured machines."
+}
+
+resolve_machine() {
+  local arg="${1:-}"
+  if [[ -z "$arg" ]]; then
+    local def; def="$(default_machine)"
+    [[ -n "$def" ]] || die "no default machine set. Run 'sshmux default <machine>' or 'sshmux add'."
+    echo "$def"
+  else
+    echo "$arg"
+  fi
+}
+
+require_fzf() {
+  command -v fzf &>/dev/null || die "'fzf' is required for this command. Install fzf and ensure it is on your PATH."
+}
+
+# Fetch tmux session names from a remote machine (returns newline-delimited list)
+remote_sessions() {
+  local user="$1" host="$2"
+  ssh -o ConnectTimeout=5 "$user@$host" \
+    "tmux list-sessions -F '#{session_name}' 2>/dev/null" 2>/dev/null || true
+}
+
+# fzf wrapper with a label
+fzf_pick() {
+  local prompt="$1"; shift
+  fzf --prompt="$prompt" --height=40% --reverse "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Verbs
+# ---------------------------------------------------------------------------
+
+cmd_help() {
+  cat <<'EOF'
+sshmux — SSH + tmux session manager
+
+Usage:
+  sshmux                              Connect to default machine, session "work"
+  sshmux connect [machine] [session]  Connect to a machine and session
+  sshmux list                         Show all configured machines (table)
+  sshmux hosts [machine]              Interactive host + session picker (fzf)
+  sshmux sessions [machine]           Interactive session picker on a machine (fzf)
+  sshmux tabs [machine]               Open one tab per tmux session (mux-aware)
+  sshmux new <session> [machine]      Create / attach a named tmux session
+  sshmux add                          Add a new machine interactively
+  sshmux default <machine>            Set the default machine
+  sshmux init                         First-run onboarding
+  sshmux help                         Show this help
+
+Config: ~/.config/sshmux/config
+Repo:   https://github.com/aaronontheweb/sshmux
+EOF
+}
+
+cmd_connect() {
+  require_config
+  parse_config
+  local machine; machine="$(resolve_machine "${1:-}")"
+  local session="${2:-}"
+  require_machine "$machine"
+
+  local user; user="$(machine_user "$machine")"
+  local host; host="$(machine_host "$machine")"
+  [[ -z "$session" ]] && session="$(machine_session "$machine")"
+  [[ -z "$session" ]] && session="work"
+
+  echo "sshmux: connecting to $machine ($user@$host) → session '$session'"
+  exec ssh -t "$user@$host" "tmux new-session -A -s $(printf '%q' "$session")"
+}
+
+cmd_list() {
+  require_config
+  parse_config
+  if [[ ${#MACHINES[@]} -eq 0 ]]; then
+    echo "No machines configured. Run 'sshmux add' to add one."
+    return
+  fi
+
+  local def; def="$(default_machine)"
+  printf "%-22s %-28s %-18s\n" "MACHINE" "HOST" "DEFAULT SESSION"
+  printf "%-22s %-28s %-18s\n" "-------" "----" "---------------"
+  for m in "${MACHINES[@]}"; do
+    local user; user="$(machine_user "$m")"
+    local host; host="$(machine_host "$m")"
+    local sess; sess="$(machine_session "$m")"
+    local marker=""; [[ "$m" == "$def" ]] && marker=" *"
+    printf "%-22s %-28s %-18s%s\n" "$m" "${user}@${host}" "$sess" "$marker"
+  done
+  echo ""
+  echo "  * = default machine"
+}
+
+cmd_hosts() {
+  require_config
+  parse_config
+  require_fzf
+  [[ ${#MACHINES[@]} -eq 0 ]] && die "no machines configured. Run 'sshmux add'."
+
+  local machine
+  if [[ ${#MACHINES[@]} -eq 1 ]]; then
+    # Only one machine — skip the host picker
+    machine="${MACHINES[0]}"
+    echo "sshmux: only one machine configured, using '$machine'"
+  else
+    # fzf host picker
+    local def; def="$(default_machine)"
+    local lines=()
+    for m in "${MACHINES[@]}"; do
+      local user; user="$(machine_user "$m")"
+      local host; host="$(machine_host "$m")"
+      local sess; sess="$(machine_session "$m")"
+      local marker=""; [[ "$m" == "$def" ]] && marker=" [default]"
+      lines+=("$(printf '%-22s %-28s default-session=%-15s%s' "$m" "${user}@${host}" "$sess" "$marker")")
+    done
+
+    local selected
+    selected=$(printf '%s\n' "${lines[@]}" | fzf_pick "host> ") || { echo "sshmux: no host selected."; exit 0; }
+    machine=$(echo "$selected" | awk '{print $1}')
+  fi
+
+  require_machine "$machine"
+
+  # Now pick session on that machine
+  _pick_session_on "$machine"
+}
+
+cmd_sessions() {
+  require_config
+  parse_config
+  require_fzf
+  local machine; machine="$(resolve_machine "${1:-}")"
+  require_machine "$machine"
+  _pick_session_on "$machine"
+}
+
+# Internal: fzf session picker on a given machine, then connect
+_pick_session_on() {
+  local machine="$1"
+  local user; user="$(machine_user "$machine")"
+  local host; host="$(machine_host "$machine")"
+
+  local sessions
+  sessions=$(remote_sessions "$user" "$host")
+
+  local session
+  if [[ -z "$sessions" ]]; then
+    echo "sshmux: no existing tmux sessions on $machine. Starting a new 'work' session."
+    session="work"
+  else
+    session=$(echo "$sessions" | fzf_pick "$machine session> " \
+      --header="TAB to multi-select, ENTER to connect (or type a new session name)" \
+      --print-query --bind "tab:toggle" 2>/dev/null \
+      | tail -1) || true
+
+    [[ -z "$session" ]] && { echo "sshmux: no session selected."; exit 0; }
+  fi
+
+  cmd_connect "$machine" "$session"
+}
+
+cmd_tabs() {
+  require_config
+  parse_config
+  local machine; machine="$(resolve_machine "${1:-}")"
+  require_machine "$machine"
+
+  local user; user="$(machine_user "$machine")"
+  local host; host="$(machine_host "$machine")"
+
+  local sessions
+  sessions=$(remote_sessions "$user" "$host")
+
+  if [[ -z "$sessions" ]]; then
+    echo "sshmux: no tmux sessions found on $machine"
+    return 1
+  fi
+
+  if [[ -n "${ZELLIJ_SESSION_NAME:-}" ]]; then
+    # Inside Zellij
+    while IFS= read -r session; do
+      zellij action new-tab --name "${machine}:${session}"
+      zellij action write-chars "sshmux connect ${machine} ${session}"
+      zellij action write 13
+    done <<< "$sessions"
+  elif [[ -n "${TMUX:-}" ]]; then
+    # Inside tmux
+    while IFS= read -r session; do
+      tmux new-window -n "${machine}:${session}" \
+        "sshmux connect $(printf '%q' "$machine") $(printf '%q' "$session")"
+    done <<< "$sessions"
+  else
+    echo "sshmux: not inside Zellij or tmux. Run manually:"
+    while IFS= read -r session; do
+      echo "  sshmux connect ${machine} ${session}"
+    done <<< "$sessions"
+  fi
+}
+
+cmd_new() {
+  require_config
+  parse_config
+  [[ -z "${1:-}" ]] && die "usage: sshmux new <session-name> [machine]"
+  local session="$1"
+  local machine; machine="$(resolve_machine "${2:-}")"
+  require_machine "$machine"
+
+  local user; user="$(machine_user "$machine")"
+  local host; host="$(machine_host "$machine")"
+
+  echo "sshmux: creating/attaching session '$session' on $machine"
+  exec ssh -t "$user@$host" "tmux new-session -A -s $(printf '%q' "$session")"
+}
+
+cmd_add() {
+  mkdir -p "$CONFIG_DIR"
+  echo ""
+  echo "sshmux: Add a new machine"
+  echo "--------------------------"
+
+  local nickname user host default_session set_default
+
+  while true; do
+    read -rp "Machine nickname (e.g. 'ubuntu24-dev'): " nickname
+    nickname="${nickname// /-}"
+    [[ -n "$nickname" ]] && break
+    echo "  Nickname cannot be empty."
+  done
+
+  while true; do
+    read -rp "SSH username: " user
+    [[ -n "$user" ]] && break
+    echo "  Username cannot be empty."
+  done
+
+  while true; do
+    read -rp "SSH host or IP: " host
+    [[ -n "$host" ]] && break
+    echo "  Host cannot be empty."
+  done
+
+  read -rp "Default tmux session name [work]: " default_session
+  default_session="${default_session:-work}"
+
+  # Detect if first machine
+  parse_config 2>/dev/null || true
+  if [[ ${#MACHINES[@]} -eq 0 ]]; then
+    set_default="y"
+    echo "  (Setting as default — first machine configured.)"
+  else
+    read -rp "Set as default machine? [y/N]: " set_default
+    set_default="${set_default:-n}"
+  fi
+
+  # Ensure config file exists with [default] section
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    printf '[default]\nmachine =\n' > "$CONFIG_FILE"
+  fi
+
+  printf '\n[machine.%s]\nuser = %s\nhost = %s\ndefault_session = %s\n' \
+    "$nickname" "$user" "$host" "$default_session" >> "$CONFIG_FILE"
+
+  [[ "${set_default,,}" == "y" ]] && cmd_default "$nickname"
+
+  echo ""
+  echo "sshmux: '$nickname' added. Run 'sshmux list' to see all machines."
+}
+
+cmd_default() {
+  require_config
+  parse_config
+  local machine="${1:-}"
+  [[ -n "$machine" ]] || die "usage: sshmux default <machine>"
+  require_machine "$machine"
+
+  if grep -q "^\[default\]" "$CONFIG_FILE"; then
+    python3 - "$CONFIG_FILE" "$machine" <<'PYEOF'
+import sys, re
+path, new_machine = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    lines = f.readlines()
+in_default = False
+replaced = False
+result = []
+for line in lines:
+    if re.match(r'^\[default\]', line):
+        in_default = True
+        result.append(line)
+    elif re.match(r'^\[', line):
+        in_default = False
+        result.append(line)
+    elif in_default and re.match(r'^machine\s*=', line) and not replaced:
+        result.append(f'machine = {new_machine}\n')
+        replaced = True
+    else:
+        result.append(line)
+if not replaced:
+    # [default] section existed but had no machine = line
+    for i, line in enumerate(result):
+        if re.match(r'^\[default\]', line):
+            result.insert(i + 1, f'machine = {new_machine}\n')
+            break
+with open(path, 'w') as f:
+    f.writelines(result)
+PYEOF
+  else
+    local tmp; tmp="$(mktemp)"
+    { printf '[default]\nmachine = %s\n\n' "$machine"; cat "$CONFIG_FILE"; } > "$tmp"
+    mv "$tmp" "$CONFIG_FILE"
+  fi
+
+  echo "sshmux: default machine set to '$machine'"
+}
+
+cmd_init() {
+  echo ""
+  echo "Welcome to sshmux!"
+  echo "=================="
+  echo "sshmux manages SSH + tmux sessions across multiple remote machines."
+  echo ""
+  mkdir -p "$CONFIG_DIR"
+
+  if [[ -f "$CONFIG_FILE" ]]; then
+    echo "Config already exists at $CONFIG_FILE"
+    echo "Run 'sshmux add' to add more machines or 'sshmux list' to see existing ones."
+    return
+  fi
+
+  printf '[default]\nmachine =\n' > "$CONFIG_FILE"
+  echo "Config created at $CONFIG_FILE"
+  echo ""
+  cmd_add
+
+  echo ""
+  echo "Setup complete!"
+  echo ""
+  echo "Make sure sshmux is on your PATH (add to ~/.bashrc):"
+  echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+  echo ""
+  echo "Then run 'sshmux help' to see all commands."
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+KNOWN_VERBS=(connect list hosts sessions tabs new add default init help)
+
+is_verb() {
+  local v; for v in "${KNOWN_VERBS[@]}"; do [[ "$v" == "$1" ]] && return 0; done; return 1
+}
+
+main() {
+  local verb="${1:-}"
+
+  # No args: connect to default machine, session "work"
+  if [[ -z "$verb" ]]; then
+    cmd_connect
+    return
+  fi
+
+  if is_verb "$verb"; then
+    shift
+    "cmd_${verb}" "$@"
+    return
+  fi
+
+  # Unknown first arg: treat as machine name (implicit connect)
+  cmd_connect "$@"
+}
+
+main "$@"

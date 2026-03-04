@@ -1,0 +1,18 @@
+# sshmux example config
+# Location: ~/.config/sshmux/config
+#
+# Run 'sshmux init' or 'sshmux add' to generate this interactively.
+
+[default]
+# Which machine to connect to when running 'sshmux' with no arguments
+machine = ubuntu24-dev
+
+[machine.ubuntu24-dev]
+user = petabridge
+host = ubuntu24-dev
+default_session = work
+
+[machine.ubuntu22-build]
+user = builder
+host = 192.168.1.50
+default_session = main
