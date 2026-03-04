@@ -419,6 +419,12 @@ main() {
     return
   fi
 
+  # Support --help and -h flags
+  if [[ "$verb" == "--help" || "$verb" == "-h" ]]; then
+    cmd_help
+    return
+  fi
+
   if is_verb "$verb"; then
     shift
     "cmd_${verb}" "$@"
