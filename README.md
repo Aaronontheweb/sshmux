@@ -120,6 +120,10 @@ sshmux default ubuntu22-build
 sshmux list
 ```
 
+## License
+
+MIT — see [LICENSE](LICENSE).
+
 ## tmux setup on remote machines
 
 Install tmux and optionally add a `~/.tmux.conf` for a better experience:
